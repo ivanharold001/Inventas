@@ -1363,16 +1363,36 @@ class VentasProvider with ChangeNotifier {
     Venta venta,
     ProductProvider productProvider,
   ) async {
+    // 1. Consolidar descuentos por ID de producto para evitar datos obsoletos
+    final Map<int, int> deductions = {};
     for (var item in venta.items) {
       int unitsPerItem = 1;
       if (item.esSurtido || item.esPorPaquete) {
         unitsPerItem = item.producto.unidadesPorPaquete;
       }
-
-      int stockToReduce = item.cantidad * unitsPerItem;
-      int newStock = item.producto.stock - stockToReduce;
-      await productProvider.updateStock(item.producto.id!, newStock);
+      int totalUnits = item.cantidad * unitsPerItem;
+      deductions[item.producto.id!] =
+          (deductions[item.producto.id!] ?? 0) + totalUnits;
     }
+
+    // 2. Aplicar descuentos consolidados usando el stock más reciente
+    for (var entry in deductions.entries) {
+      final productId = entry.key;
+      final totalToReduce = entry.value;
+
+      try {
+        // Buscamos el producto en la lista del provider para tener el stock actual real
+        final currentProduct = productProvider.products.firstWhere(
+          (p) => p.id == productId,
+        );
+        int newStock = currentProduct.stock - totalToReduce;
+        await productProvider.updateStock(productId, newStock);
+      } catch (e) {
+        debugPrint('Error actualizando stock para producto $productId: $e');
+        // Si el producto no se encuentra o hay otro error, continuamos con el siguiente
+      }
+    }
+
     await _dbHelper.updateVentaEstado(venta.id!, VentaEstado.COMPLETADA);
     await fetchVentas();
   }
