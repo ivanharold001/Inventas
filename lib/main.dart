@@ -10,6 +10,11 @@ import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
+import 'package:qr_flutter/qr_flutter.dart';
+import 'package:local_auth/local_auth.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'excel_service.dart';
 
 // --- MODELOS DE DATOS ---
 
@@ -32,8 +37,9 @@ class Product {
   final int stock;
   final double precioPaquete;
   final double precioUnidad;
-  final double precioPaqueteSurtido; // NUEVO: precio paquete surtido
+  final double precioPaqueteSurtido;
   final List<String> fotoPaths;
+  final String? qrCode; // NUEVO: código QR único
 
   Product({
     this.id,
@@ -47,6 +53,7 @@ class Product {
     required this.precioUnidad,
     this.precioPaqueteSurtido = 0.0,
     this.fotoPaths = const [],
+    this.qrCode,
   });
 
   Map<String, dynamic> toMap() {
@@ -61,6 +68,7 @@ class Product {
       'precio_paquete': precioPaquete,
       'precio_unidad': precioUnidad,
       'precio_paquete_surtido': precioPaqueteSurtido,
+      'qr_code': qrCode,
     };
   }
 
@@ -77,10 +85,11 @@ class Product {
       precioUnidad: (map['precio_unidad'] as num?)?.toDouble() ?? 0.0,
       precioPaqueteSurtido:
           (map['precio_paquete_surtido'] as num?)?.toDouble() ?? 0.0,
+      qrCode: map['qr_code'],
     );
   }
 
-  Product copyWith({List<String>? fotoPaths, int? stock}) {
+  Product copyWith({List<String>? fotoPaths, int? stock, String? qrCode}) {
     return Product(
       id: id,
       nombre: nombre,
@@ -93,6 +102,7 @@ class Product {
       precioUnidad: precioUnidad,
       precioPaqueteSurtido: precioPaqueteSurtido,
       fotoPaths: fotoPaths ?? this.fotoPaths,
+      qrCode: qrCode ?? this.qrCode,
     );
   }
 }
@@ -253,7 +263,7 @@ class DatabaseHelper {
 
     return await openDatabase(
       path,
-      version: 13,
+      version: 16,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
       onOpen: (db) async {
@@ -319,7 +329,11 @@ class DatabaseHelper {
         username TEXT UNIQUE,
         password TEXT,
         role TEXT,
-        photo_path TEXT
+        photo_path TEXT,
+        biometric_enabled INTEGER DEFAULT 0,
+        nombre TEXT,
+        telefono TEXT,
+        created_at TEXT
       )
     ''');
     // Insert default admin
@@ -341,7 +355,8 @@ class DatabaseHelper {
         stock INTEGER,
         precio_paquete REAL,
         precio_paquete_surtido REAL DEFAULT 0,
-        precio_unidad REAL
+        precio_unidad REAL,
+        qr_code TEXT
       )
     ''');
     await db.execute('''
@@ -573,6 +588,29 @@ class DatabaseHelper {
         )
       ''');
     }
+    if (oldVersion < 14) {
+      try {
+        await db.execute('ALTER TABLE productos ADD COLUMN qr_code TEXT');
+      } catch (_) {}
+    }
+    if (oldVersion < 15) {
+      try {
+        await db.execute(
+          'ALTER TABLE users ADD COLUMN biometric_enabled INTEGER DEFAULT 0',
+        );
+      } catch (_) {}
+    }
+    if (oldVersion < 16) {
+      try {
+        await db.execute('ALTER TABLE users ADD COLUMN nombre TEXT');
+        await db.execute('ALTER TABLE users ADD COLUMN telefono TEXT');
+        await db.execute('ALTER TABLE users ADD COLUMN created_at TEXT');
+        // Inicializar created_at para usuarios existentes
+        await db.update('users', {
+          'created_at': DateTime.now().toIso8601String(),
+        }, where: 'created_at IS NULL');
+      } catch (_) {}
+    }
   }
 
   // --- PRODUCTOS ---
@@ -596,6 +634,32 @@ class DatabaseHelper {
         });
       }
       return productId;
+    });
+  }
+
+  Future<void> insertProductsBatch(List<Product> products) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (var product in products) {
+        int productId = await txn.insert(
+          'productos',
+          product.toMap(),
+          conflictAlgorithm: ConflictAlgorithm.replace,
+        );
+        // Nota: En importación masiva las fotos suelen estar vacías,
+        // pero limpiamos por si acaso hay colisiones por ID.
+        await txn.delete(
+          'product_images',
+          where: 'product_id = ?',
+          whereArgs: [productId],
+        );
+        for (String path in product.fotoPaths) {
+          await txn.insert('product_images', {
+            'product_id': productId,
+            'image_path': path,
+          });
+        }
+      }
     });
   }
 
@@ -679,6 +743,16 @@ class DatabaseHelper {
   Future<void> deleteUser(int id) async {
     final db = await database;
     await db.delete('users', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<void> updateUserBiometrics(int userId, bool enabled) async {
+    final db = await database;
+    await db.update(
+      'users',
+      {'biometric_enabled': enabled ? 1 : 0},
+      where: 'id = ?',
+      whereArgs: [userId],
+    );
   }
 
   Future<List<Product>> getProducts() async {
@@ -888,6 +962,10 @@ class User {
   final String password;
   final UserRole role;
   final String photoPath;
+  final bool biometricEnabled;
+  final String? nombre;
+  final String? telefono;
+  final DateTime createdAt;
 
   User({
     this.id,
@@ -895,7 +973,11 @@ class User {
     required this.password,
     required this.role,
     required this.photoPath,
-  });
+    this.biometricEnabled = false,
+    this.nombre,
+    this.telefono,
+    DateTime? createdAt,
+  }) : createdAt = createdAt ?? DateTime.now();
 
   Map<String, dynamic> toMap() {
     return {
@@ -904,6 +986,10 @@ class User {
       'password': password,
       'role': role.toString().split('.').last,
       'photo_path': photoPath,
+      'biometric_enabled': biometricEnabled ? 1 : 0,
+      'nombre': nombre,
+      'telefono': telefono,
+      'created_at': createdAt.toIso8601String(),
     };
   }
 
@@ -917,6 +1003,36 @@ class User {
         orElse: () => UserRole.sales,
       ),
       photoPath: map['photo_path'] ?? '',
+      biometricEnabled: (map['biometric_enabled'] as int?) == 1,
+      nombre: map['nombre'],
+      telefono: map['telefono'],
+      createdAt: map['created_at'] != null
+          ? DateTime.parse(map['created_at'])
+          : DateTime.now(),
+    );
+  }
+
+  User copyWith({
+    int? id,
+    String? username,
+    String? password,
+    UserRole? role,
+    String? photoPath,
+    bool? biometricEnabled,
+    String? nombre,
+    String? telefono,
+    DateTime? createdAt,
+  }) {
+    return User(
+      id: id ?? this.id,
+      username: username ?? this.username,
+      password: password ?? this.password,
+      role: role ?? this.role,
+      photoPath: photoPath ?? this.photoPath,
+      biometricEnabled: biometricEnabled ?? this.biometricEnabled,
+      nombre: nombre ?? this.nombre,
+      telefono: telefono ?? this.telefono,
+      createdAt: createdAt ?? this.createdAt,
     );
   }
 }
@@ -935,6 +1051,50 @@ extension VentaItemCopyWith on VentaItem {
       esPorPaquete: esPorPaquete,
       verificado: verificado,
     );
+  }
+}
+
+// --- SERVICIOS ---
+
+class BiometricService {
+  final LocalAuthentication auth = LocalAuthentication();
+  final FlutterSecureStorage storage = const FlutterSecureStorage();
+
+  Future<bool> holdsBiometrics() async {
+    try {
+      return await auth.canCheckBiometrics || await auth.isDeviceSupported();
+    } catch (e) {
+      return false;
+    }
+  }
+
+  Future<bool> authenticate() async {
+    try {
+      return await auth.authenticate(
+        localizedReason: 'Autentíquese para ingresar al sistema',
+      );
+    } catch (e) {
+      return false;
+    }
+  }
+
+  Future<void> saveCredentials(String username, String password) async {
+    await storage.write(key: 'user_id', value: username);
+    await storage.write(key: 'password', value: password);
+  }
+
+  Future<Map<String, String>?> getCredentials() async {
+    String? username = await storage.read(key: 'user_id');
+    String? password = await storage.read(key: 'password');
+    if (username != null && password != null) {
+      return {'username': username, 'password': password};
+    }
+    return null;
+  }
+
+  Future<void> clearCredentials() async {
+    await storage.delete(key: 'user_id');
+    await storage.delete(key: 'password');
   }
 }
 
@@ -986,6 +1146,50 @@ class UserProvider with ChangeNotifier {
     await _dbHelper.deleteUser(id);
     notifyListeners();
   }
+
+  // --- LÓGICA BIOMÉTRICA ---
+  final BiometricService _biometricService = BiometricService();
+
+  Future<bool> canUseBiometrics() async {
+    return await _biometricService.holdsBiometrics();
+  }
+
+  Future<bool> loginWithBiometrics() async {
+    bool authenticated = await _biometricService.authenticate();
+    if (authenticated) {
+      final creds = await _biometricService.getCredentials();
+      if (creds != null) {
+        return await login(creds['username']!, creds['password']!);
+      }
+    }
+    return false;
+  }
+
+  Future<void> updateBiometricPreference(bool enabled, String password) async {
+    if (_currentUser == null) return;
+    final updatedUser = _currentUser!.copyWith(biometricEnabled: enabled);
+    await _dbHelper.updateUserBiometrics(updatedUser.id!, enabled);
+    _currentUser = updatedUser;
+
+    if (enabled) {
+      await _biometricService.saveCredentials(_currentUser!.username, password);
+    } else {
+      await _biometricService.clearCredentials();
+    }
+    notifyListeners();
+  }
+
+  Future<void> updateUserProfile(User updatedUser) async {
+    final db = await _dbHelper.database;
+    await db.update(
+      'users',
+      updatedUser.toMap(),
+      where: 'id = ?',
+      whereArgs: [updatedUser.id],
+    );
+    _currentUser = updatedUser;
+    notifyListeners();
+  }
 }
 
 class ProductProvider with ChangeNotifier {
@@ -1029,13 +1233,47 @@ class ProductProvider with ChangeNotifier {
 
   Future<void> addProduct(Product product) async {
     final dbHelper = DatabaseHelper();
-    await dbHelper.insertProduct(product);
+    // Generar QR si no tiene uno (best practice)
+    Product productToInsert = product;
+    if (product.qrCode == null || product.qrCode!.isEmpty) {
+      productToInsert = product.copyWith(qrCode: const Uuid().v4());
+    }
+    await dbHelper.insertProduct(productToInsert);
+    await fetchProducts();
+  }
+
+  Future<void> addProducts(List<Product> products) async {
+    final dbHelper = DatabaseHelper();
+    List<Product> productsToInsert = [];
+
+    for (var product in products) {
+      Product p = product;
+      if (p.qrCode == null || p.qrCode!.isEmpty) {
+        p = p.copyWith(qrCode: const Uuid().v4());
+      }
+      productsToInsert.add(p);
+    }
+
+    await dbHelper.insertProductsBatch(productsToInsert);
     await fetchProducts();
   }
 
   Future<void> updateProduct(Product product) async {
     final dbHelper = DatabaseHelper();
-    await dbHelper.updateProduct(product);
+
+    // Seguridad QR: Asegurar que nunca se pierda el QR original
+    Product productToUpdate = product;
+    if (product.qrCode == null || product.qrCode!.isEmpty) {
+      final existingProduct = await dbHelper.getProductById(product.id!);
+      if (existingProduct != null && existingProduct.qrCode != null) {
+        productToUpdate = product.copyWith(qrCode: existingProduct.qrCode);
+      } else {
+        // Solo si realmente nunca tuvo uno (falló la creación original)
+        productToUpdate = product.copyWith(qrCode: const Uuid().v4());
+      }
+    }
+
+    await dbHelper.updateProduct(productToUpdate);
     await fetchProducts();
   }
 
@@ -1221,6 +1459,15 @@ class VentasProvider with ChangeNotifier {
     await _dbHelper.deleteVentaEmbalajeImage(ventaId, imagePath);
     await fetchVentas();
   }
+
+  Future<int> getUserSalesCount(int userId) async {
+    final db = await _dbHelper.database;
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) FROM ventas WHERE user_id = ?',
+      [userId],
+    );
+    return Sqflite.firstIntValue(result) ?? 0;
+  }
 }
 
 void main() {
@@ -1284,6 +1531,27 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _loginBiometric() async {
+    setState(() => _isLoading = true);
+    final userProvider = Provider.of<UserProvider>(context, listen: false);
+    final success = await userProvider.loginWithBiometrics();
+    setState(() => _isLoading = false);
+
+    if (!mounted) return;
+
+    if (success) {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(builder: (context) => const MainLayout()),
+      );
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Error de autenticación biométrica o no configurada'),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -1341,6 +1609,29 @@ class _LoginScreenState extends State<LoginScreen> {
                       : const Text('Iniciar Sesión'),
                 ),
               ),
+              if (!_isLoading) ...[
+                const SizedBox(height: 24),
+                FutureBuilder<bool>(
+                  future: Provider.of<UserProvider>(
+                    context,
+                    listen: false,
+                  ).canUseBiometrics(),
+                  builder: (context, snapshot) {
+                    if (snapshot.data == true) {
+                      return IconButton(
+                        icon: const Icon(
+                          Icons.fingerprint,
+                          size: 70,
+                          color: Colors.indigo,
+                        ),
+                        onPressed: _loginBiometric,
+                        tooltip: 'Iniciar sesión con huella',
+                      );
+                    }
+                    return const SizedBox.shrink();
+                  },
+                ),
+              ],
             ],
           ),
         ),
@@ -1452,66 +1743,290 @@ class ProfileScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<UserProvider>(
-      builder: (context, userProvider, child) {
+    return Consumer2<UserProvider, VentasProvider>(
+      builder: (context, userProvider, ventasProvider, child) {
         final user = userProvider.currentUser;
         if (user == null) return const SizedBox();
 
-        return Center(
-          child: SingleChildScrollView(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                CircleAvatar(
-                  radius: 60,
-                  backgroundColor: Colors.indigo.shade800,
-                  child: Text(
-                    user.username.substring(0, 1).toUpperCase(),
-                    style: const TextStyle(
-                      fontSize: 48,
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 24),
-                Text(
-                  user.username,
-                  style: const TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _getRoleDisplayName(user.role),
-                  style: TextStyle(fontSize: 18, color: Colors.grey.shade600),
-                ),
-                const SizedBox(height: 48),
-                SizedBox(
-                  width: 300,
-                  child: ElevatedButton.icon(
-                    onPressed: () {
-                      userProvider.logout();
-                      Navigator.of(context).pushReplacement(
-                        MaterialPageRoute(
-                          builder: (context) => const LoginScreen(),
+        final accountAge = DateTime.now().difference(user.createdAt).inDays;
+
+        return FutureBuilder<int>(
+          future: ventasProvider.getUserSalesCount(user.id!),
+          builder: (context, snapshot) {
+            final salesCount = snapshot.data ?? 0;
+
+            return Center(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(24.0),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Stack(
+                      children: [
+                        CircleAvatar(
+                          radius: 70,
+                          backgroundColor: Colors.indigo.shade800,
+                          backgroundImage: user.photoPath.isNotEmpty
+                              ? FileImage(File(user.photoPath))
+                              : null,
+                          child: user.photoPath.isEmpty
+                              ? Text(
+                                  user.username.substring(0, 1).toUpperCase(),
+                                  style: const TextStyle(
+                                    fontSize: 56,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                )
+                              : null,
                         ),
-                      );
-                    },
-                    icon: const Icon(Icons.logout),
-                    label: const Text('Cerrar Sesión'),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.red.shade700,
+                        Positioned(
+                          bottom: 0,
+                          right: 0,
+                          child: CircleAvatar(
+                            backgroundColor: Colors.indigo,
+                            child: IconButton(
+                              icon: const Icon(
+                                Icons.camera_alt,
+                                color: Colors.white,
+                              ),
+                              onPressed: () =>
+                                  _pickProfilePhoto(context, userProvider),
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
+                    const SizedBox(height: 24),
+                    Text(
+                      user.nombre ?? user.username,
+                      style: const TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      _getRoleDisplayName(user.role),
+                      style: TextStyle(
+                        fontSize: 18,
+                        color: Colors.grey.shade600,
+                      ),
+                    ),
+                    if (user.telefono != null && user.telefono!.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8.0),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            const Icon(
+                              Icons.phone,
+                              size: 16,
+                              color: Colors.grey,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              user.telefono!,
+                              style: const TextStyle(color: Colors.grey),
+                            ),
+                          ],
+                        ),
+                      ),
+                    const SizedBox(height: 32),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                      children: [
+                        _buildStatCard(
+                          'Ventas Generadas',
+                          salesCount.toString(),
+                          Icons.receipt_long,
+                        ),
+                        _buildStatCard(
+                          'Días de la Cuenta',
+                          accountAge.toString(),
+                          Icons.calendar_today,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 32),
+                    Card(
+                      elevation: 0,
+                      color: Colors.grey.shade100,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8.0),
+                        child: FutureBuilder<bool>(
+                          future: userProvider.canUseBiometrics(),
+                          builder: (context, snapshot) {
+                            if (snapshot.data == true) {
+                              return SwitchListTile(
+                                secondary: const Icon(Icons.fingerprint),
+                                title: const Text('Ingreso con Huella'),
+                                subtitle: const Text(
+                                  'Permitir iniciar sesión usando biometría',
+                                ),
+                                value: user.biometricEnabled,
+                                onChanged: (bool value) async {
+                                  if (value) {
+                                    _showPasswordConfirmDialog(
+                                      context,
+                                      userProvider,
+                                    );
+                                  } else {
+                                    await userProvider
+                                        .updateBiometricPreference(false, '');
+                                  }
+                                },
+                              );
+                            }
+                            return const ListTile(
+                              leading: Icon(
+                                Icons.fingerprint,
+                                color: Colors.grey,
+                              ),
+                              title: Text('Huella no disponible'),
+                              subtitle: Text(
+                                'Su dispositivo no soporta biometría',
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 40),
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: () {
+                          userProvider.logout();
+                          Navigator.of(context).pushReplacement(
+                            MaterialPageRoute(
+                              builder: (context) => const LoginScreen(),
+                            ),
+                          );
+                        },
+                        icon: const Icon(Icons.logout),
+                        label: const Text('Cerrar Sesión'),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.red.shade700,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(vertical: 16),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                 ),
-              ],
-            ),
-          ),
+              ),
+            );
+          },
         );
       },
+    );
+  }
+
+  Widget _buildStatCard(String label, String value, IconData icon) {
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        width: 150,
+        child: Column(
+          children: [
+            Icon(icon, color: Colors.indigo, size: 32),
+            const SizedBox(height: 12),
+            Text(
+              value,
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _pickProfilePhoto(
+    BuildContext context,
+    UserProvider userProvider,
+  ) async {
+    final picker = ImagePicker();
+    final pickedFile = await picker.pickImage(source: ImageSource.gallery);
+
+    if (pickedFile != null) {
+      final appDir = await getApplicationDocumentsDirectory();
+      final fileName = p.basename(pickedFile.path);
+      final savedImage = await File(
+        pickedFile.path,
+      ).copy('${appDir.path}/$fileName');
+
+      final user = userProvider.currentUser;
+      if (user != null) {
+        final updatedUser = user.copyWith(photoPath: savedImage.path);
+        await userProvider.updateUserProfile(updatedUser);
+      }
+    }
+  }
+
+  void _showPasswordConfirmDialog(
+    BuildContext context,
+    UserProvider userProvider,
+  ) {
+    final controller = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Confirmar Contraseña'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Para habilitar el ingreso con huella, ingrese su contraseña actual para guardarla de forma segura.',
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              obscureText: true,
+              decoration: const InputDecoration(
+                labelText: 'Contraseña',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCELAR'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              if (controller.text.trim() ==
+                  userProvider.currentUser?.password) {
+                await userProvider.updateBiometricPreference(
+                  true,
+                  controller.text.trim(),
+                );
+                if (context.mounted) Navigator.pop(context);
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Contraseña incorrecta')),
+                );
+              }
+            },
+            child: const Text('CONFIRMAR'),
+          ),
+        ],
+      ),
     );
   }
 
@@ -1557,16 +2072,19 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     });
   }
 
-  Future<void> _showAddUserDialog() async {
-    final usernameController = TextEditingController();
-    final passwordController = TextEditingController();
-    UserRole selectedRole = UserRole.sales;
+  Future<void> _showUserFormDialog({User? user}) async {
+    final isEditing = user != null;
+    final usernameController = TextEditingController(text: user?.username);
+    final passwordController = TextEditingController(text: user?.password);
+    final nombreController = TextEditingController(text: user?.nombre);
+    final telefonoController = TextEditingController(text: user?.telefono);
+    UserRole selectedRole = user?.role ?? UserRole.sales;
 
     await showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Agregar Usuario'),
+          title: Text(isEditing ? 'Editar Usuario' : 'Agregar Usuario'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
@@ -1585,6 +2103,22 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                   decoration: const InputDecoration(
                     labelText: 'Contraseña',
                     prefixIcon: Icon(Icons.lock),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: nombreController,
+                  decoration: const InputDecoration(
+                    labelText: 'Nombre Completo (opcional)',
+                    prefixIcon: Icon(Icons.person_outline),
+                  ),
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: telefonoController,
+                  decoration: const InputDecoration(
+                    labelText: 'Teléfono (opcional)',
+                    prefixIcon: Icon(Icons.phone),
                   ),
                 ),
                 const SizedBox(height: 16),
@@ -1626,27 +2160,139 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                   return;
                 }
 
-                final newUser = User(
-                  username: usernameController.text,
-                  password: passwordController.text,
-                  role: selectedRole,
-                  photoPath: '',
-                );
-
                 final userProvider = Provider.of<UserProvider>(
                   context,
                   listen: false,
                 );
-                await userProvider.addUser(newUser);
+
+                if (isEditing) {
+                  final updatedUser = user.copyWith(
+                    username: usernameController.text,
+                    password: passwordController.text,
+                    role: selectedRole,
+                    nombre: nombreController.text.isNotEmpty
+                        ? nombreController.text
+                        : null,
+                    telefono: telefonoController.text.isNotEmpty
+                        ? telefonoController.text
+                        : null,
+                  );
+                  await userProvider.updateUserProfile(updatedUser);
+                } else {
+                  final newUser = User(
+                    username: usernameController.text,
+                    password: passwordController.text,
+                    role: selectedRole,
+                    photoPath: '',
+                    nombre: nombreController.text.isNotEmpty
+                        ? nombreController.text
+                        : null,
+                    telefono: telefonoController.text.isNotEmpty
+                        ? telefonoController.text
+                        : null,
+                  );
+                  await userProvider.addUser(newUser);
+                }
+
                 Navigator.pop(context);
                 _loadUsers();
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Usuario agregado')),
+                    SnackBar(
+                      content: Text(
+                        isEditing ? 'Usuario actualizado' : 'Usuario agregado',
+                      ),
+                    ),
                   );
                 }
               },
-              child: const Text('Agregar'),
+              child: Text(isEditing ? 'Guardar' : 'Agregar'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showUserDetailModal(User user) async {
+    final ventasProvider = Provider.of<VentasProvider>(context, listen: false);
+    final accountAge = DateTime.now().difference(user.createdAt).inDays;
+    final salesCount = await ventasProvider.getUserSalesCount(user.id!);
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.only(
+          topLeft: Radius.circular(20),
+          topRight: Radius.circular(20),
+        ),
+      ),
+      builder: (context) => Padding(
+        padding: const EdgeInsets.all(24.0),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  radius: 30,
+                  backgroundColor: Colors.indigo.shade800,
+                  backgroundImage: user.photoPath.isNotEmpty
+                      ? FileImage(File(user.photoPath))
+                      : null,
+                  child: user.photoPath.isEmpty
+                      ? Text(
+                          user.username.substring(0, 1).toUpperCase(),
+                          style: const TextStyle(color: Colors.white),
+                        )
+                      : null,
+                ),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        user.nombre ?? user.username,
+                        style: const TextStyle(
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(_getRoleDisplayName(user.role)),
+                    ],
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.edit, color: Colors.indigo),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    _showUserFormDialog(user: user);
+                  },
+                ),
+              ],
+            ),
+            const Divider(height: 32),
+            ListTile(
+              leading: const Icon(Icons.person_outline),
+              title: const Text('Usuario'),
+              subtitle: Text(user.username),
+            ),
+            if (user.telefono != null)
+              ListTile(
+                leading: const Icon(Icons.phone),
+                title: const Text('Teléfono'),
+                subtitle: Text(user.telefono!),
+              ),
+            ListTile(
+              leading: const Icon(Icons.calendar_today),
+              title: const Text('Antigüedad'),
+              subtitle: Text('$accountAge días'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.receipt_long),
+              title: const Text('Ventas/Listas Generadas'),
+              subtitle: Text(salesCount.toString()),
             ),
           ],
         ),
@@ -1718,33 +2364,50 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
 
                 return Card(
                   child: ListTile(
+                    onTap: () => _showUserDetailModal(user),
                     leading: CircleAvatar(
                       backgroundColor: Colors.indigo.shade800,
-                      child: Text(
-                        user.username.substring(0, 1).toUpperCase(),
-                        style: const TextStyle(color: Colors.white),
-                      ),
+                      backgroundImage: user.photoPath.isNotEmpty
+                          ? FileImage(File(user.photoPath))
+                          : null,
+                      child: user.photoPath.isEmpty
+                          ? Text(
+                              user.username.substring(0, 1).toUpperCase(),
+                              style: const TextStyle(color: Colors.white),
+                            )
+                          : null,
                     ),
                     title: Text(
-                      user.username,
+                      user.nombre ?? user.username,
                       style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
                     subtitle: Text(_getRoleDisplayName(user.role)),
-                    trailing: isCurrentUser
-                        ? Chip(
+                    trailing: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (user.id != null)
+                          IconButton(
+                            icon: const Icon(Icons.edit, color: Colors.blue),
+                            onPressed: () => _showUserFormDialog(user: user),
+                          ),
+                        if (isCurrentUser)
+                          Chip(
                             label: const Text('Tú'),
                             backgroundColor: Colors.indigo.shade100,
                           )
-                        : IconButton(
+                        else
+                          IconButton(
                             icon: const Icon(Icons.delete, color: Colors.red),
                             onPressed: () => _deleteUser(user),
                           ),
+                      ],
+                    ),
                   ),
                 );
               },
             ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: _showAddUserDialog,
+        onPressed: () => _showUserFormDialog(),
         icon: const Icon(Icons.person_add, color: Colors.white),
         label: const Text(
           'Agregar Usuario',
@@ -1934,7 +2597,97 @@ class ProductListScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Inventario')),
+      appBar: AppBar(
+        title: const Text('Inventario'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.file_download),
+            tooltip: 'Exportar a Excel',
+            onPressed: () {
+              final products = Provider.of<ProductProvider>(
+                context,
+                listen: false,
+              ).products;
+              ExcelService.exportProducts(products);
+            },
+          ),
+          IconButton(
+            icon: const Icon(Icons.file_upload),
+            tooltip: 'Importar desde Excel',
+            onPressed: () async {
+              final newProducts = await ExcelService.importProducts();
+              if (newProducts != null && newProducts.isNotEmpty) {
+                if (!context.mounted) return;
+                bool? confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Confirmar Importación'),
+                    content: Text(
+                      'Se han encontrado ${newProducts.length} productos. ¿Deseas agregarlos al inventario?',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context, false),
+                        child: const Text('Cancelar'),
+                      ),
+                      ElevatedButton(
+                        onPressed: () => Navigator.pop(context, true),
+                        child: const Text('Importar'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (confirm == true) {
+                  if (!context.mounted) return;
+                  // Mostrar loader
+                  showDialog(
+                    context: context,
+                    barrierDismissible: false,
+                    builder: (context) =>
+                        const Center(child: CircularProgressIndicator()),
+                  );
+
+                  try {
+                    await Provider.of<ProductProvider>(
+                      context,
+                      listen: false,
+                    ).addProducts(newProducts);
+
+                    if (!context.mounted) return;
+                    Navigator.pop(context); // Cerrar loader
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(
+                        content: Text(
+                          '${newProducts.length} productos importados con éxito',
+                        ),
+                      ),
+                    );
+                  } catch (e) {
+                    if (!context.mounted) return;
+                    Navigator.pop(context); // Cerrar loader
+                    showDialog(
+                      context: context,
+                      builder: (context) => AlertDialog(
+                        title: const Text('Error de Importación'),
+                        content: Text(
+                          'No se pudieron agregar los productos: $e',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () => Navigator.pop(context),
+                            child: const Text('Entendido'),
+                          ),
+                        ],
+                      ),
+                    );
+                  }
+                }
+              }
+            },
+          ),
+        ],
+      ),
       body: Column(
         children: [
           Padding(
@@ -2321,21 +3074,17 @@ class ProductListScreen extends StatelessWidget {
                           _buildDetailRow(
                             Icons.inventory,
                             'Stock Total',
-                            '${product.stock} Unidades',
+                            '${product.stock ~/ product.unidadesPorPaquete} Paquetes cerrados',
                           ),
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
                               const Text(
-                                'Paquetes + Unidades:',
+                                'Producto Suelto:',
                                 style: TextStyle(fontWeight: FontWeight.bold),
                               ),
                               Text(
-                                '${(product.stock ~/ product.unidadesPorPaquete)} P + ${(product.stock % product.unidadesPorPaquete)} U',
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  fontSize: 18,
-                                ),
+                                '${(product.stock % product.unidadesPorPaquete)} Unidades',
                               ),
                             ],
                           ),
@@ -2368,6 +3117,44 @@ class ProductListScreen extends StatelessWidget {
                       product.precioUnidad,
                       Colors.green.shade800,
                     ),
+                    const Divider(height: 32),
+                    const Text(
+                      'Código identificación único (QR)',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.indigo,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    if (product.qrCode != null)
+                      Center(
+                        child: Column(
+                          children: [
+                            QrImageView(
+                              data: product.qrCode!,
+                              version: QrVersions.auto,
+                              size: 180.0,
+                              backgroundColor: Colors.white,
+                            ),
+                            const SizedBox(height: 8),
+                            SelectableText(
+                              product.qrCode!,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ],
+                        ),
+                      )
+                    else
+                      const Center(
+                        child: Text(
+                          'No hay código QR generado para este producto.',
+                          style: TextStyle(fontStyle: FontStyle.italic),
+                        ),
+                      ),
                     const SizedBox(height: 16),
                   ],
                 ),
@@ -2944,6 +3731,7 @@ class _EditProductScreenState
           double.tryParse(super._precioPaqueteSurtidoController.text) ?? 0.0,
       precioUnidad: double.parse(super._precioUnidadController.text),
       fotoPaths: finalImagePaths,
+      qrCode: widget.product.qrCode, // PRESERVAR EL QR ORIGINAL
     );
     if (!mounted) return;
     await Provider.of<ProductProvider>(
