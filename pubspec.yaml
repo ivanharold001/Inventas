@@ -26,6 +26,7 @@ dependencies:
   excel: ^4.0.6
   file_picker: ^10.3.10
   share_plus: ^12.0.1
+  google_fonts: ^8.0.2
 
 dev_dependencies:
   flutter_test:
